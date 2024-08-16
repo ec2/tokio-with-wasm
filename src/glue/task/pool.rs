@@ -1,14 +1,13 @@
 use crate::glue::common::*;
-use js_sys::Array;
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use web_sys::{
-    Blob, BlobPropertyBag, DedicatedWorkerGlobalScope, ErrorEvent, Event, MessageEvent, Url,
-    Worker, WorkerOptions,
+    console, Blob, BlobPropertyBag, DedicatedWorkerGlobalScope, ErrorEvent, Event, MessageEvent,
+    Url, Worker, WorkerOptions,
 };
-
 pub static MAX_WORKERS: usize = 512;
 
 #[wasm_bindgen]
@@ -30,6 +29,15 @@ struct ManagedWorker {
 
 struct Task {
     callable: Box<dyn FnOnce() + Send>,
+}
+#[wasm_bindgen(module = "/src/glue/task/wot.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = createWorker)]
+    fn create_worker_js(module: &JsValue, memory: &JsValue) -> Worker;
+}
+fn _ensure_worker_emitted() {
+    // Just ensure that the worker is emitted into the output folder, but don't actually use the URL.
+    wasm_bindgen::link_to!(module = "/src/glue/task/wot.worker.js");
 }
 
 #[wasm_bindgen]
@@ -70,45 +78,8 @@ impl WorkerPool {
     /// message is sent to it.
     fn create_worker(&self) -> Result<Worker> {
         *self.pool_state.total_workers_count.borrow_mut() += 1;
-        let script = format!(
-            "
-            import init, * as wasm_bindgen from '{}';
-            globalThis.wasm_bindgen = wasm_bindgen;
-            self.onmessage = event => {{
-                let initialised = init(...event.data).catch(err => {{
-                    // Propagate to main `onerror`:
-                    setTimeout(() => {{
-                        throw err;
-                    }});
-                    // Rethrow to keep promise rejected and prevent execution of further commands:
-                    throw err;
-                }});
 
-                self.onmessage = async event => {{
-                    // This will queue further commands up until the module is fully initialised:
-                    await initialised;
-                    wasm_bindgen.task_worker_entry_point(event.data);
-                }};
-            }};
-            ",
-            get_script_path()?
-        );
-        let blob = Blob::new_with_blob_sequence_and_options(
-            &Array::from_iter([JsValue::from(script)]).into(),
-            BlobPropertyBag::new().type_("text/javascript"),
-        )?;
-        let url = Url::create_object_url_with_blob(&blob)?;
-        let mut options = WorkerOptions::new();
-        options.type_(web_sys::WorkerType::Module);
-        let worker = Worker::new_with_options(&url, &options)?;
-
-        // With a worker spun up send it the module/memory so it can start
-        // instantiating the wasm module. Later it might receive further
-        // messages about code to run on the wasm module.
-        let array = js_sys::Array::new();
-        array.push(&wasm_bindgen::module());
-        array.push(&wasm_bindgen::memory());
-        worker.post_message(&array)?;
+        let worker = create_worker_js(&wasm_bindgen::module(), &wasm_bindgen::memory());
 
         Ok(worker)
     }
@@ -257,7 +228,7 @@ impl PoolState {
     fn push_worker(&self, worker: Worker) {
         worker.set_onmessage(Some(self.callback.as_ref().unchecked_ref()));
         worker.set_onerror(Some(self.callback.as_ref().unchecked_ref()));
-        let mut workers = self.idle_workers.borrow_mut();
+        let mut workers: std::cell::RefMut<Vec<ManagedWorker>> = self.idle_workers.borrow_mut();
         for prev in workers.iter() {
             let prev: &JsValue = &prev.worker;
             let worker: &JsValue = &worker;
@@ -278,24 +249,4 @@ pub fn task_worker_entry_point(ptr: u32) -> Result<()> {
     (ptr.callable)();
     global.post_message(&JsValue::undefined())?;
     Ok(())
-}
-
-pub fn get_script_path() -> Result<String> {
-    let string = js_sys::eval(
-        r"
-        (() => {
-            try {
-                throw new Error();
-            } catch (e) {
-                let parts = e.stack.match(/(?:\(|@)(\S+):\d+:\d+/);
-                return parts[1];
-            }
-        })()
-        ",
-    )?
-    .as_string()
-    .ok_or(JsValue::from(
-        "Could not convert JS string path to native string",
-    ))?;
-    Ok(string)
 }
